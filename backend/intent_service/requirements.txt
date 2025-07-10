@@ -1,0 +1,7 @@
+fastapi==0.96.0
+uvicorn==0.22.0
+pydantic==1.10.8
+transformers==4.29.2
+torch==2.0.1
+numpy==1.24.3
+prometheus-client==0.16.0

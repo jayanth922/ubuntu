@@ -1,0 +1,105 @@
+version: '3.8'
+
+services:
+  # Frontend services
+  frontend:
+    build: ./frontend
+    ports:
+      - "3000:3000"
+    environment:
+      - REACT_APP_API_URL=http://localhost:8000
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+    depends_on:
+      - dialog_manager
+
+  # Backend services
+  intent_service:
+    build: ./backend/intent_service
+    ports:
+      - "8001:8000"
+    volumes:
+      - ./backend/intent_service:/app
+    environment:
+      - LOG_LEVEL=INFO
+    depends_on:
+      - redis
+
+  dialog_manager:
+    build: ./backend/dialog_manager
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./backend/dialog_manager:/app
+      - /app/node_modules
+    environment:
+      - INTENT_SERVICE_URL=http://intent_service:8000
+      - RAG_SERVICE_URL=http://rag_service:8000
+      - REDIS_URL=redis://redis:6379
+    depends_on:
+      - intent_service
+      - rag_service
+      - redis
+
+  rag_service:
+    build: ./backend/rag_service
+    ports:
+      - "8002:8000"
+    volumes:
+      - ./backend/rag_service:/app
+      - ./data:/data
+    environment:
+      - LOG_LEVEL=INFO
+    depends_on:
+      - redis
+
+  # Infrastructure services
+  redis:
+    image: redis:7.0-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+
+  postgres:
+    image: postgres:15-alpine
+    ports:
+      - "5432:5432"
+    environment:
+      - POSTGRES_USER=chatbot
+      - POSTGRES_PASSWORD=chatbot_pass
+      - POSTGRES_DB=chatbot_db
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+  # Monitoring stack
+  prometheus:
+    image: prom/prometheus:v2.42.0
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./infra/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml
+    command: 
+      - '--config.file=/etc/prometheus/prometheus.yml'
+
+  grafana:
+    image: grafana/grafana:9.4.7
+    ports:
+      - "3002:3000"
+    volumes:
+      - ./infra/grafana/provisioning:/etc/grafana/provisioning
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=grafana
+    depends_on:
+      - prometheus
+
+  loki:
+    image: grafana/loki:2.8.0
+    ports:
+      - "3100:3100"
+
+volumes:
+  redis_data:
+  postgres_data:
