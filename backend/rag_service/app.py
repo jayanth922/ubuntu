@@ -8,9 +8,6 @@ import logging
 from typing import List, Dict, Optional
 import json
 import random
-import time
-from prometheus_client import make_wsgi_app, Counter, Histogram
-from fastapi.middleware.wsgi import WSGIMiddleware
 
 # Import our new components
 from utils.document_chunking import DocumentChunker
@@ -30,31 +27,6 @@ app = FastAPI(
     description="Retrieval-Augmented Generation for technical support queries",
     version="0.1.0"
 )
-
-# Define Prometheus metrics
-REQUEST_COUNT = Counter('rag_requests_total', 'Total RAG Service Requests', ['method', 'endpoint', 'status'])
-REQUEST_LATENCY = Histogram('rag_request_duration_seconds', 'RAG Service Request Latency', ['method', 'endpoint'])
-RETRIEVAL_COUNT = Counter('rag_retrievals_total', 'Number of retrievals performed', ['status'])
-CONFIDENCE_HISTOGRAM = Histogram('rag_confidence_score', 'Confidence scores for retrievals')
-QUERY_REWRITE_COUNT = Counter('rag_query_rewrites_total', 'Number of query rewrites performed')
-
-# Add middleware to record metrics
-@app.middleware("http")
-async def monitor_requests(request, call_next):
-    method = request.method
-    path = request.url.path
-    
-    start_time = time.time()
-    response = await call_next(request)
-    duration = time.time() - start_time
-    
-    REQUEST_LATENCY.labels(method=method, endpoint=path).observe(duration)
-    REQUEST_COUNT.labels(method=method, endpoint=path, status=response.status_code).inc()
-    
-    return response
-
-# Mount metrics endpoint
-app.mount("/metrics", WSGIMiddleware(make_wsgi_app()))
 
 # Configure CORS
 app.add_middleware(
@@ -213,7 +185,6 @@ async def health_check():
 async def retrieve(request: RAGRequest):
     if search_engine is None or query_rewriter is None:
         # For MVP without initialized components, return a default response
-        RETRIEVAL_COUNT.labels(status="fallback").inc()
         return fallback_response(request.query, request.intent)
     
     try:
@@ -222,7 +193,6 @@ async def retrieve(request: RAGRequest):
         rewritten_query = query_rewriter.rewrite_query(original_query, request.context)
         
         if rewritten_query != original_query:
-            QUERY_REWRITE_COUNT.inc()
             logger.info(f"Rewritten query: '{original_query}' -> '{rewritten_query}'")
         
         # Step 2: Search for relevant documents
@@ -234,7 +204,6 @@ async def retrieve(request: RAGRequest):
         
         # Step 3: Process results and build response
         if not results:
-            RETRIEVAL_COUNT.labels(status="no_results").inc()
             return fallback_response(request.query, request.intent)
             
         # Get the best result
@@ -251,12 +220,10 @@ async def retrieve(request: RAGRequest):
                 response_text = parent_doc["response"]
         
         if not response_text:
-            RETRIEVAL_COUNT.labels(status="no_response").inc()
             return fallback_response(request.query, request.intent)
         
         # Calculate confidence
         confidence = best_result.get("similarity_score", 0.0)
-        CONFIDENCE_HISTOGRAM.observe(confidence)
         
         # Format the sources
         sources = []
@@ -269,10 +236,8 @@ async def retrieve(request: RAGRequest):
                 "id": result.get("id") or result.get("chunk_id", "unknown"),
                 "content": content,
                 "similarity": result.get("similarity_score", 0.0),
-                "source": result.get("source", "Unknown")
-            })
-        
-        RETRIEVAL_COUNT.labels(status="success").inc()
+                "source": result.get("source", "Unknown")            })
+
         return RAGResponse(
             response=response_text,
             sources=sources,
@@ -282,7 +247,6 @@ async def retrieve(request: RAGRequest):
     
     except Exception as e:
         logger.error(f"Error in retrieval: {e}")
-        RETRIEVAL_COUNT.labels(status="error").inc()
         return fallback_response(request.query, request.intent)
 
 def fallback_response(query, intent=None):

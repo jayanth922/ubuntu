@@ -194,22 +194,6 @@ function App() {
     return <>{parts}</>;
   };
   
-  const handleFeedback = (messageIndex, isPositive) => {
-    // Clone messages array to avoid direct state mutation
-    const updatedMessages = [...messages];
-    
-    // Update the message metadata with feedback
-    if (updatedMessages[messageIndex] && updatedMessages[messageIndex].metadata) {
-      updatedMessages[messageIndex].metadata.feedback = isPositive ? 'positive' : 'negative';
-      setMessages(updatedMessages);
-      
-      // In a real app, you'd send this feedback to your backend
-      console.log(`Feedback for message ${messageIndex}: ${isPositive ? 'positive' : 'negative'}`);
-      
-      // TODO: Send feedback to backend API
-    }
-  };
-
   const startNewConversation = () => {
     // Generate new session ID
     const newSessionId = generateSessionId();
@@ -267,25 +251,6 @@ function App() {
                 
                 <div className="message-timestamp">
                   {formatTimestamp(message.timestamp)}
-                  
-                  {message.role === 'assistant' && (
-                    <div className="message-feedback">
-                      <button 
-                        className={`feedback-btn ${message.metadata?.feedback === 'positive' ? 'active' : ''}`}
-                        onClick={() => handleFeedback(index, true)}
-                        aria-label="Helpful"
-                      >
-                        👍
-                      </button>
-                      <button 
-                        className={`feedback-btn ${message.metadata?.feedback === 'negative' ? 'active' : ''}`}
-                        onClick={() => handleFeedback(index, false)}
-                        aria-label="Not helpful"
-                      >
-                        👎
-                      </button>
-                    </div>
-                  )}
                 </div>
               </div>
             </div>

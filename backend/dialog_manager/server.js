@@ -4,7 +4,6 @@ const bodyParser = require('body-parser');
 const axios = require('axios');
 const { v4: uuidv4 } = require('uuid');
 const redis = require('redis');
-const promClient = require('prom-client');
 const contextManager = require('./context_manager');
 
 // Environment variables
@@ -19,48 +18,6 @@ const app = express();
 // Configure middleware
 app.use(cors());
 app.use(bodyParser.json());
-
-// Setup Prometheus metrics
-const register = new promClient.Registry();
-promClient.collectDefaultMetrics({ register });
-
-// Custom metrics
-const httpRequestDurationMicroseconds = new promClient.Histogram({
-  name: 'http_request_duration_seconds',
-  help: 'Duration of HTTP requests in seconds',
-  labelNames: ['method', 'route', 'code'],
-  buckets: [0.1, 0.3, 0.5, 0.7, 1, 3, 5, 7, 10]
-});
-
-const chatRequestCounter = new promClient.Counter({
-  name: 'chat_requests_total',
-  help: 'Total number of chat requests',
-  labelNames: ['intent']
-});
-
-const chatResponseTime = new promClient.Histogram({
-  name: 'chat_response_time_seconds',
-  help: 'Response time for chat requests in seconds',
-  buckets: [0.1, 0.5, 1, 2, 5, 10]
-});
-
-const userFeedbackCounter = new promClient.Counter({
-  name: 'user_feedback_total',
-  help: 'User feedback on responses',
-  labelNames: ['type']
-});
-
-const contextEnhancementCounter = new promClient.Counter({
-  name: 'context_enhancements_total',
-  help: 'Number of responses enhanced with context',
-  labelNames: ['type']
-});
-
-register.registerMetric(httpRequestDurationMicroseconds);
-register.registerMetric(chatRequestCounter);
-register.registerMetric(chatResponseTime);
-register.registerMetric(userFeedbackCounter);
-register.registerMetric(contextEnhancementCounter);
 
 // Initialize Redis client
 let redisClient;
@@ -84,25 +41,6 @@ async function initRedis() {
   }
 }
 
-// Middleware to measure request duration
-app.use((req, res, next) => {
-  const end = httpRequestDurationMicroseconds.startTimer();
-  res.on('finish', () => {
-    end({ method: req.method, route: req.path, code: res.statusCode });
-  });
-  next();
-});
-
-// Metrics endpoint
-app.get('/metrics', async (req, res) => {
-  try {
-    res.set('Content-Type', register.contentType);
-    res.end(await register.metrics());
-  } catch (error) {
-    res.status(500).end(error);
-  }
-});
-
 // Health check endpoint
 app.get('/health', (req, res) => {
   res.json({
@@ -117,7 +55,6 @@ app.get('/health', (req, res) => {
 
 // Chat endpoint
 app.post('/chat', async (req, res) => {
-  const timer = chatResponseTime.startTimer();
   
   try {
     const { message, session_id = uuidv4(), context = {} } = req.body;
@@ -153,9 +90,6 @@ app.post('/chat', async (req, res) => {
       });
       intentResponse = intentResult.data;
       console.log('Intent classified:', intentResponse.intent);
-      
-      // Record intent metric
-      chatRequestCounter.inc({ intent: intentResponse.intent });
       
       // Update topic memory
       contextManager.updateTopicMemory(session_id, intentResponse.intent, message);
@@ -211,10 +145,6 @@ app.post('/chat', async (req, res) => {
       },
       session_id
     );
-    
-    if (enhancedResponse !== ragResponse.response) {
-      contextEnhancementCounter.inc({ type: 'context_added' });
-    }
     
     // Generate suggested follow-up questions
     const suggestions = contextManager.generateSuggestions(
@@ -281,8 +211,6 @@ app.post('/chat', async (req, res) => {
       error: 'An error occurred processing your request',
       message: error.message
     });
-  } finally {
-    timer.end();
   }
 });
 
@@ -308,73 +236,6 @@ app.get('/history/:session_id', async (req, res) => {
     console.error('History retrieval error:', error);
     res.status(500).json({
       error: 'An error occurred retrieving chat history',
-      message: error.message
-    });
-  }
-});
-
-// Feedback endpoint
-app.post('/feedback', async (req, res) => {
-  try {
-    const { session_id, message_id, feedback_type, message_content } = req.body;
-    
-    if (!session_id || !feedback_type) {
-      return res.status(400).json({ error: 'Session ID and feedback type are required' });
-    }
-    
-    // Record feedback metric
-    userFeedbackCounter.inc({ type: feedback_type });
-    
-    // Store feedback for future analysis
-    if (redisClient) {
-      const feedbackData = {
-        session_id,
-        message_id,
-        feedback_type,
-        message_content,
-        timestamp: new Date().toISOString()
-      };
-      
-      await redisClient.rPush('feedback:logs', JSON.stringify(feedbackData));
-    }
-    
-    res.json({ success: true });
-    
-  } catch (error) {
-    console.error('Feedback processing error:', error);
-    res.status(500).json({
-      error: 'An error occurred processing feedback',
-      message: error.message
-    });
-  }
-});
-
-// Suggestion usage endpoint
-app.post('/track/suggestion', async (req, res) => {
-  try {
-    const { session_id, suggestion } = req.body;
-    
-    if (!session_id || !suggestion) {
-      return res.status(400).json({ error: 'Session ID and suggestion are required' });
-    }
-    
-    // Record usage of suggestions
-    if (redisClient) {
-      const trackData = {
-        session_id,
-        suggestion,
-        timestamp: new Date().toISOString()
-      };
-      
-      await redisClient.rPush('suggestion:usage', JSON.stringify(trackData));
-    }
-    
-    res.json({ success: true });
-    
-  } catch (error) {
-    console.error('Suggestion tracking error:', error);
-    res.status(500).json({
-      error: 'An error occurred tracking suggestion usage',
       message: error.message
     });
   }

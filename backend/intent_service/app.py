@@ -8,9 +8,6 @@ import torch
 from typing import List, Dict, Optional
 import os
 import logging
-from prometheus_client import make_wsgi_app, Counter, Histogram
-from fastapi.middleware.wsgi import WSGIMiddleware
-import time
 
 # Configure logging
 logging.basicConfig(
@@ -25,30 +22,6 @@ app = FastAPI(
     description="Service for classifying user intents in technical support queries",
     version="0.1.0"
 )
-
-# Define Prometheus metrics
-REQUEST_COUNT = Counter('intent_requests_total', 'Total Intent Classification Requests', ['method', 'endpoint', 'status'])
-REQUEST_LATENCY = Histogram('intent_request_duration_seconds', 'Intent Classification Request Latency', ['method', 'endpoint'])
-INTENT_COUNTER = Counter('intent_classifications_total', 'Number of intent classifications', ['intent'])
-CONFIDENCE_HISTOGRAM = Histogram('intent_confidence_score', 'Confidence scores for intent classifications')
-
-# Add middleware to record metrics
-@app.middleware("http")
-async def monitor_requests(request, call_next):
-    method = request.method
-    path = request.url.path
-    
-    start_time = time.time()
-    response = await call_next(request)
-    duration = time.time() - start_time
-    
-    REQUEST_LATENCY.labels(method=method, endpoint=path).observe(duration)
-    REQUEST_COUNT.labels(method=method, endpoint=path, status=response.status_code).inc()
-    
-    return response
-
-# Mount metrics endpoint
-app.mount("/metrics", WSGIMiddleware(make_wsgi_app()))
 
 # Configure CORS
 app.add_middleware(
@@ -109,10 +82,6 @@ async def classify_intent(request: IntentRequest):
         intent, confidence = rule_based_intent(request.text)
         entities = extract_entities(request.text, intent)
         
-        # Record metrics
-        INTENT_COUNTER.labels(intent=intent).inc()
-        CONFIDENCE_HISTOGRAM.observe(confidence)
-        
         return IntentResponse(
             intent=intent,
             confidence=confidence,
@@ -137,10 +106,6 @@ async def classify_intent(request: IntentRequest):
     
     # Extract entities
     entities = extract_entities(request.text, intent)
-    
-    # Record metrics
-    INTENT_COUNTER.labels(intent=intent).inc()
-    CONFIDENCE_HISTOGRAM.observe(confidence)
     
     logger.info(f"Classified intent: {intent} with confidence: {confidence:.4f}")
     
