@@ -4,6 +4,7 @@ const bodyParser = require('body-parser');
 const axios = require('axios');
 const { v4: uuidv4 } = require('uuid');
 const redis = require('redis');
+const circuitBreaker = require('opossum');
 const contextManager = require('./context_manager');
 
 // Environment variables
@@ -41,6 +42,60 @@ async function initRedis() {
   }
 }
 
+// Configure circuit breaker options
+const circuitBreakerOptions = {
+  timeout: 5000,                // Time in ms to wait for a response
+  errorThresholdPercentage: 50, // Error percentage threshold to trip the circuit
+  resetTimeout: 30000           // Time in ms to wait before trying again
+};
+
+// Create circuit breakers for service calls
+const intentServiceBreaker = new circuitBreaker(
+  async (data) => {
+    return await axios.post(`${INTENT_SERVICE_URL}/classify`, data);
+  }, 
+  circuitBreakerOptions
+);
+
+const ragServiceBreaker = new circuitBreaker(
+  async (data) => {
+    return await axios.post(`${RAG_SERVICE_URL}/retrieve`, data);
+  },
+  circuitBreakerOptions
+);
+
+// Add fallback handlers
+intentServiceBreaker.fallback(async (data) => {
+  console.log('Intent service circuit is open, using fallback');
+  return {
+    data: { 
+      intent: "None", 
+      confidence: 0.0, 
+      entities: [] 
+    }
+  };
+});
+
+ragServiceBreaker.fallback(async (data) => {
+  console.log('RAG service circuit is open, using fallback');
+  return {
+    data: {
+      response: "I'm sorry, but I'm having trouble accessing my knowledge base right now. Please try again in a few moments.",
+      confidence: 0.0,
+      sources: []
+    }
+  };
+});
+
+// Add circuit breaker event listeners for monitoring
+intentServiceBreaker.on('open', () => console.log('Intent service circuit breaker opened'));
+intentServiceBreaker.on('halfOpen', () => console.log('Intent service circuit breaker half-open'));
+intentServiceBreaker.on('close', () => console.log('Intent service circuit breaker closed'));
+
+ragServiceBreaker.on('open', () => console.log('RAG service circuit breaker opened'));
+ragServiceBreaker.on('halfOpen', () => console.log('RAG service circuit breaker half-open'));
+ragServiceBreaker.on('close', () => console.log('RAG service circuit breaker closed'));
+
 // Health check endpoint
 app.get('/health', (req, res) => {
   res.json({
@@ -49,13 +104,16 @@ app.get('/health', (req, res) => {
       intent: `${INTENT_SERVICE_URL}/health`,
       rag: `${RAG_SERVICE_URL}/health`,
       redis: redisClient ? 'connected' : 'not connected'
+    },
+    circuitBreakers: {
+      intent: intentServiceBreaker.opened ? 'open' : intentServiceBreaker.halfOpen ? 'half-open' : 'closed',
+      rag: ragServiceBreaker.opened ? 'open' : ragServiceBreaker.halfOpen ? 'half-open' : 'closed'
     }
   });
 });
 
 // Chat endpoint
 app.post('/chat', async (req, res) => {
-  
   try {
     const { message, session_id = uuidv4(), context = {} } = req.body;
     
@@ -67,20 +125,25 @@ app.post('/chat', async (req, res) => {
     
     // Get conversation history if available
     let history = [];
-    if (redisClient) {
-      const historyJson = await redisClient.get(`chat:${session_id}:history`);
-      if (historyJson) {
-        history = JSON.parse(historyJson);
+    try {
+      if (redisClient) {
+        const historyJson = await redisClient.get(`chat:${session_id}:history`);
+        if (historyJson) {
+          history = JSON.parse(historyJson);
+        }
       }
+    } catch (redisError) {
+      console.error('Redis error retrieving history:', redisError);
+      // Continue with empty history
     }
     
     // Extract context from history using our enhanced context manager
     const extractedContext = contextManager.extractContext(history, session_id);
     
-    // Step 1: Classify intent
+    // Step 1: Classify intent with circuit breaker
     let intentResponse;
     try {
-      const intentResult = await axios.post(`${INTENT_SERVICE_URL}/classify`, {
+      const intentResult = await intentServiceBreaker.fire({
         text: message,
         session_id,
         context: {
@@ -88,6 +151,7 @@ app.post('/chat', async (req, res) => {
           ...extractedContext
         }
       });
+      
       intentResponse = intentResult.data;
       console.log('Intent classified:', intentResponse.intent);
       
@@ -99,10 +163,10 @@ app.post('/chat', async (req, res) => {
       intentResponse = { intent: 'None', confidence: 0.0, entities: [] };
     }
     
-    // Step 2: Get response from RAG service
+    // Step 2: Get response from RAG service with circuit breaker
     let ragResponse;
     try {
-      const ragResult = await axios.post(`${RAG_SERVICE_URL}/retrieve`, {
+      const ragResult = await ragServiceBreaker.fire({
         query: message,
         intent: intentResponse.intent,
         top_k: 3,
@@ -114,6 +178,7 @@ app.post('/chat', async (req, res) => {
           entities: intentResponse.entities
         }
       });
+      
       ragResponse = ragResult.data;
       console.log('RAG response received with confidence:', ragResponse.confidence);
       
@@ -124,7 +189,7 @@ app.post('/chat', async (req, res) => {
     } catch (error) {
       console.error('RAG service error:', error.message);
       ragResponse = { 
-        response: "I'm sorry, I couldn't find an answer to your question. Could you try rephrasing it?",
+        response: "I'm sorry, I couldn't find an answer to your question right now. Could you try again in a moment?",
         confidence: 0.0,
         sources: []
       };
@@ -181,10 +246,15 @@ app.post('/chat', async (req, res) => {
     }
     
     // Save updated history to Redis
-    if (redisClient) {
-      await redisClient.set(`chat:${session_id}:history`, JSON.stringify(history));
-      // Set expiration to 24 hours
-      await redisClient.expire(`chat:${session_id}:history`, 24 * 60 * 60);
+    try {
+      if (redisClient) {
+        await redisClient.set(`chat:${session_id}:history`, JSON.stringify(history));
+        // Set expiration to 24 hours
+        await redisClient.expire(`chat:${session_id}:history`, 24 * 60 * 60);
+      }
+    } catch (redisError) {
+      console.error('Redis error saving history:', redisError);
+      // Continue without saving history
     }
     
     // Clean up old sessions periodically (1% chance per request)
@@ -223,14 +293,23 @@ app.get('/history/:session_id', async (req, res) => {
       return res.status(503).json({ error: 'History service unavailable - Redis not connected' });
     }
     
-    const historyJson = await redisClient.get(`chat:${session_id}:history`);
-    
-    if (!historyJson) {
-      return res.json({ history: [] });
+    try {
+      const historyJson = await redisClient.get(`chat:${session_id}:history`);
+      
+      if (!historyJson) {
+        return res.json({ history: [] });
+      }
+      
+      const history = JSON.parse(historyJson);
+      res.json({ history });
+      
+    } catch (redisError) {
+      console.error('Redis error retrieving history:', redisError);
+      return res.status(503).json({ 
+        error: 'History service temporarily unavailable',
+        message: 'Could not retrieve chat history'
+      });
     }
-    
-    const history = JSON.parse(historyJson);
-    res.json({ history });
     
   } catch (error) {
     console.error('History retrieval error:', error);

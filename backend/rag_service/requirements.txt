@@ -7,3 +7,4 @@ sentence-transformers==2.2.2
 torch==2.0.1
 huggingface_hub==0.14.1
 rank-bm25==0.2.2
+redis==4.6.0
