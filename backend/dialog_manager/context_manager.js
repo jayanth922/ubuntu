@@ -1,8 +1,9 @@
 /**
  * Enhanced Context Manager for Dialog Manager Service
+ * Integrates features for multi-turn conversation management
  */
 class ContextManager {
-  constructor() {
+  constructor(historyWindow = 10, entityExpiry = 1200000) { // 20 minutes in ms
     // Entity memory store
     this.entityMemory = new Map();
     
@@ -14,6 +15,13 @@ class ContextManager {
     
     // Current session tracking
     this.activeContexts = new Map();
+    
+    // Configuration
+    this.historyWindow = historyWindow;
+    this.entityExpiry = entityExpiry; // milliseconds
+    
+    // Session-based conversation history
+    this.conversationHistory = new Map();
   }
   
   /**
@@ -167,19 +175,32 @@ class ContextManager {
     
     // Process the conversation history
     const recentMessages = history.slice(-5);
+    const extractedEntities = [];
     
     for (const message of recentMessages) {
+      // Store conversation history in session context
+      if (sessionId) {
+        this.updateConversationHistory(sessionId, message.role, message.content, message.metadata || {});
+      }
+      
       // Extract topics
       if (message.metadata && message.metadata.intent) {
         context.recentTopics.push(message.metadata.intent);
+        
+        // Update session topic
+        if (sessionId) {
+          this.updateSessionTopic(sessionId, message.metadata.intent);
+          this.updateSessionIntent(sessionId, message.metadata.intent);
+        }
       }
       
       // Extract entities
       if (message.metadata && message.metadata.entities) {
         for (const entity of message.metadata.entities) {
           context.mentionedEntities.add(entity.value);
+          extractedEntities.push(entity.value);
           
-          // Update entity memory
+          // Update entity memory (legacy)
           if (sessionId) {
             this.updateEntityMemory(sessionId, [entity]);
           }
@@ -205,7 +226,12 @@ class ContextManager {
       }
     }
     
-    // Get entities from memory
+    // Update session entities
+    if (sessionId && extractedEntities.length > 0) {
+      this.updateSessionEntities(sessionId, extractedEntities);
+    }
+    
+    // Get entities from memory (legacy support)
     if (sessionId && this.entityMemory.has(sessionId)) {
       const sessionMemory = this.entityMemory.get(sessionId);
       sessionMemory.forEach((value, key) => {
@@ -233,7 +259,11 @@ class ContextManager {
       ...context,
       mentionedEntities: Array.from(context.mentionedEntities),
       lastMessage: recentMessages.length > 0 ? recentMessages[recentMessages.length - 1] : null,
-      conversationDepth: this.getTurnCount(sessionId) || 0
+      conversationDepth: this.getTurnCount(sessionId) || 0,
+      // Add new session-based context
+      sessionHistory: sessionId ? this.getConversationHistory(sessionId, 5) : [],
+      recentSessionEntities: sessionId ? this.getRecentEntities(sessionId) : [],
+      lastSessionIntent: sessionId ? this.getLastIntent(sessionId) : null
     };
   }
   
@@ -394,21 +424,420 @@ class ContextManager {
   }
   
   /**
-   * Clean up old sessions
+   * Clean up old sessions (enhanced version)
    * @param {number} maxAgeMs - Maximum session age to retain
    */
   cleanupOldSessions(maxAgeMs = 86400000) { // 24 hours default
     const now = Date.now();
+    const expiredFromActiveContexts = [];
+    const expiredFromConversationHistory = this.clearExpiredSessions(maxAgeMs);
     
-    // Clean up active contexts
+    // Clean up active contexts (legacy cleanup)
     this.activeContexts.forEach((context, sessionId) => {
       if (now - context.lastUpdated > maxAgeMs) {
         this.activeContexts.delete(sessionId);
         this.entityMemory.delete(sessionId);
         this.topicMemory.delete(sessionId);
         this.turnCounts.delete(sessionId);
+        expiredFromActiveContexts.push(sessionId);
       }
     });
+    
+    return {
+      expiredSessions: expiredFromConversationHistory,
+      expiredActiveContexts: expiredFromActiveContexts.length,
+      totalCleaned: expiredFromConversationHistory + expiredFromActiveContexts.length
+    };
+  }
+
+  /**
+   * Handle multi-turn reasoning by connecting current query with previous context
+   * @param {Array} history - Conversation history
+   * @param {string} currentQuery - Current user query
+   * @returns {Object} - Object with rewritten query and reference context
+   */
+  handleMultiTurnReasoning(history, currentQuery) {
+    // Identify if this is a follow-up question
+    const lastBotMessage = history.filter(msg => msg.role === 'assistant').pop();
+    const lastUserMessage = history.filter(msg => msg.role === 'user').pop();
+    
+    if (this.isFollowUpQuestion(currentQuery, lastUserMessage?.content)) {
+      // Connect the current query with previous context
+      return {
+        rewrittenQuery: `Given that we were discussing ${this.extractTopics(lastBotMessage)}, ${currentQuery}`,
+        referenceContext: this.extractKeyInformation(history.slice(-4))
+      };
+    }
+    return { rewrittenQuery: currentQuery };
+  }
+
+  /**
+   * Check if current query is a follow-up question
+   * @param {string} query - Current query
+   * @param {string} previousQuery - Previous user query
+   * @returns {boolean} - True if this appears to be a follow-up question
+   */
+  isFollowUpQuestion(query, previousQuery) {
+    // Check for pronouns, references, or very short queries
+    const followUpIndicators = ['it', 'that', 'this', 'they', 'those', 'the same', 'what about'];
+    return followUpIndicators.some(indicator => 
+      query.toLowerCase().includes(indicator)) || 
+      query.split(' ').length <= 5;
+  }
+
+  /**
+   * Extract topics from a bot message
+   * @param {Object} message - Bot message object
+   * @returns {string} - Extracted topics as string
+   */
+  extractTopics(message) {
+    if (!message || !message.content) return 'general Ubuntu topics';
+    
+    // Extract key topics from the message content
+    const content = message.content.toLowerCase();
+    const topics = [];
+    
+    if (content.includes('update') || content.includes('upgrade')) {
+      topics.push('Ubuntu updates');
+    }
+    if (content.includes('printer') || content.includes('printing')) {
+      topics.push('printer setup');
+    }
+    if (content.includes('install') || content.includes('package')) {
+      topics.push('software installation');
+    }
+    if (content.includes('network') || content.includes('wifi')) {
+      topics.push('network configuration');
+    }
+    if (content.includes('driver') || content.includes('hardware')) {
+      topics.push('hardware drivers');
+    }
+    
+    return topics.length > 0 ? topics.join(' and ') : 'Ubuntu support topics';
+  }
+
+  /**
+   * Extract key information from recent conversation history
+   * @param {Array} recentHistory - Recent conversation messages
+   * @returns {Object} - Key information extracted from history
+   */
+  extractKeyInformation(recentHistory) {
+    if (!recentHistory || recentHistory.length === 0) {
+      return { entities: [], topics: [], problems: [] };
+    }
+
+    const context = {
+      entities: [],
+      topics: [],
+      problems: [],
+      solutions: []
+    };
+
+    recentHistory.forEach(message => {
+      if (message.metadata) {
+        // Extract entities
+        if (message.metadata.entities) {
+          context.entities.push(...message.metadata.entities.map(e => e.value));
+        }
+        
+        // Extract intent as topic
+        if (message.metadata.intent) {
+          context.topics.push(message.metadata.intent);
+        }
+      }
+
+      // Extract problems from user messages
+      if (message.role === 'user') {
+        const content = message.content.toLowerCase();
+        if (content.includes('error') || content.includes('problem') || 
+            content.includes('issue') || content.includes('not working')) {
+          context.problems.push(message.content);
+        }
+      }
+
+      // Extract solutions from assistant messages
+      if (message.role === 'assistant') {
+        const content = message.content.toLowerCase();
+        if (content.includes('try') || content.includes('run') || 
+            content.includes('install') || content.includes('configure')) {
+          context.solutions.push(message.content);
+        }
+      }
+    });
+
+    // Remove duplicates
+    context.entities = [...new Set(context.entities)];
+    context.topics = [...new Set(context.topics)];
+
+    return context;
+  }
+
+  /**
+   * Get or create session context
+   * @param {string} sessionId - Session identifier
+   * @returns {Object} - Session context object
+   */
+  getSessionContext(sessionId) {
+    if (!this.conversationHistory.has(sessionId)) {
+      this.conversationHistory.set(sessionId, {
+        history: [],
+        entities: new Map(),
+        topics: [],
+        lastIntent: null,
+        createdAt: Date.now()
+      });
+    }
+    return this.conversationHistory.get(sessionId);
+  }
+
+  /**
+   * Update conversation history for a session
+   * @param {string} sessionId - Session identifier
+   * @param {string} role - Role (user/assistant)
+   * @param {string} content - Message content
+   * @param {Object} metadata - Additional metadata
+   */
+  updateConversationHistory(sessionId, role, content, metadata = {}) {
+    const context = this.getSessionContext(sessionId);
+    
+    const entry = {
+      role,
+      content,
+      timestamp: Date.now(),
+      ...metadata
+    };
+    
+    context.history.push(entry);
+    
+    // Maintain history window
+    if (context.history.length > this.historyWindow) {
+      context.history = context.history.slice(-this.historyWindow);
+    }
+  }
+
+  /**
+   * Update entities for a session with expiry tracking
+   * @param {string} sessionId - Session identifier
+   * @param {Array} entities - Array of entity strings
+   */
+  updateSessionEntities(sessionId, entities) {
+    const context = this.getSessionContext(sessionId);
+    const now = Date.now();
+    
+    entities.forEach(entity => {
+      const key = entity.toLowerCase();
+      context.entities.set(key, {
+        value: entity,
+        lastSeen: now
+      });
+    });
+  }
+
+  /**
+   * Get recent entities that haven't expired
+   * @param {string} sessionId - Session identifier
+   * @returns {Array} - Array of recent entity values
+   */
+  getRecentEntities(sessionId) {
+    const context = this.getSessionContext(sessionId);
+    const now = Date.now();
+    const recentEntities = [];
+    
+    context.entities.forEach((entityData, key) => {
+      if (now - entityData.lastSeen < this.entityExpiry) {
+        recentEntities.push(entityData.value);
+      }
+    });
+    
+    return recentEntities;
+  }
+
+  /**
+   * Update topic for a session
+   * @param {string} sessionId - Session identifier
+   * @param {string} topic - Topic to add
+   */
+  updateSessionTopic(sessionId, topic) {
+    const context = this.getSessionContext(sessionId);
+    context.topics.push(topic);
+    
+    // Keep only last 3 topics
+    if (context.topics.length > 3) {
+      context.topics = context.topics.slice(-3);
+    }
+  }
+
+  /**
+   * Get last N topics for a session
+   * @param {string} sessionId - Session identifier
+   * @param {number} n - Number of topics to retrieve
+   * @returns {Array} - Array of recent topics
+   */
+  getLastTopics(sessionId, n = 1) {
+    const context = this.getSessionContext(sessionId);
+    return context.topics.slice(-n);
+  }
+
+  /**
+   * Update last intent for a session
+   * @param {string} sessionId - Session identifier
+   * @param {string} intent - Intent to store
+   */
+  updateSessionIntent(sessionId, intent) {
+    const context = this.getSessionContext(sessionId);
+    context.lastIntent = intent;
+  }
+
+  /**
+   * Get last intent for a session
+   * @param {string} sessionId - Session identifier
+   * @returns {string|null} - Last intent or null
+   */
+  getLastIntent(sessionId) {
+    const context = this.getSessionContext(sessionId);
+    return context.lastIntent;
+  }
+
+  /**
+   * Resolve pronouns in user query using recent entities
+   * @param {string} sessionId - Session identifier
+   * @param {string} query - User query to process
+   * @returns {string} - Query with pronouns resolved
+   */
+  resolvePronouns(sessionId, query) {
+    const pronouns = ['it', 'this', 'that', 'they', 'those'];
+    const recentEntities = this.getRecentEntities(sessionId);
+    
+    if (recentEntities.length === 0) {
+      return query;
+    }
+    
+    let resolvedQuery = query;
+    const mostRecentEntity = recentEntities[recentEntities.length - 1];
+    
+    pronouns.forEach(pronoun => {
+      const regex = new RegExp(`\\b${pronoun}\\b`, 'gi');
+      if (regex.test(resolvedQuery)) {
+        resolvedQuery = resolvedQuery.replace(regex, mostRecentEntity);
+      }
+    });
+    
+    return resolvedQuery;
+  }
+
+  /**
+   * Get conversation history for a session
+   * @param {string} sessionId - Session identifier
+   * @param {number} limit - Maximum number of messages to return
+   * @returns {Array} - Array of conversation messages
+   */
+  getConversationHistory(sessionId, limit = null) {
+    const context = this.getSessionContext(sessionId);
+    const history = context.history;
+    
+    if (limit && limit < history.length) {
+      return history.slice(-limit);
+    }
+    
+    return [...history];
+  }
+
+  /**
+   * Clear expired sessions based on creation time
+   * @param {number} expiry - Session expiry time in milliseconds (default: 2 hours)
+   */
+  clearExpiredSessions(expiry = 7200000) {
+    const now = Date.now();
+    const expiredSessions = [];
+    
+    this.conversationHistory.forEach((context, sessionId) => {
+      if (now - context.createdAt > expiry) {
+        expiredSessions.push(sessionId);
+      }
+    });
+    
+    expiredSessions.forEach(sessionId => {
+      this.conversationHistory.delete(sessionId);
+      this.entityMemory.delete(sessionId);
+      this.topicMemory.delete(sessionId);
+      this.turnCounts.delete(sessionId);
+      this.activeContexts.delete(sessionId);
+    });
+    
+    return expiredSessions.length;
+  }
+
+  /**
+   * Enhanced query rewriting with context
+   * @param {string} sessionId - Session identifier
+   * @param {string} query - Original user query
+   * @returns {Object} - Object with rewritten query and context
+   */
+  rewriteQueryWithContext(sessionId, query) {
+    // Resolve pronouns first
+    const resolvedQuery = this.resolvePronouns(sessionId, query);
+    
+    // Get recent context
+    const recentTopics = this.getLastTopics(sessionId, 2);
+    const recentEntities = this.getRecentEntities(sessionId);
+    const lastIntent = this.getLastIntent(sessionId);
+    
+    // Check if this appears to be a follow-up question
+    const isFollowUp = this.isFollowUpQuestion(resolvedQuery);
+    
+    let rewrittenQuery = resolvedQuery;
+    let contextInfo = {
+      recentTopics,
+      recentEntities,
+      lastIntent,
+      isFollowUp
+    };
+    
+    // If it's a follow-up and we have context, enhance the query
+    if (isFollowUp && (recentTopics.length > 0 || recentEntities.length > 0)) {
+      const contextParts = [];
+      
+      if (recentEntities.length > 0) {
+        contextParts.push(`regarding ${recentEntities.slice(-2).join(' and ')}`);
+      }
+      
+      if (recentTopics.length > 0) {
+        contextParts.push(`about ${recentTopics.join(' and ')}`);
+      }
+      
+      if (contextParts.length > 0) {
+        rewrittenQuery = `Given our discussion ${contextParts.join(' ')}, ${resolvedQuery}`;
+      }
+    }
+    
+    return {
+      originalQuery: query,
+      resolvedQuery,
+      rewrittenQuery,
+      context: contextInfo
+    };
+  }
+
+  /**
+   * Check if a query appears to be a follow-up question
+   * @param {string} query - User query
+   * @returns {boolean} - True if appears to be follow-up
+   */
+  isFollowUpQuestion(query) {
+    const followUpIndicators = [
+      'it', 'this', 'that', 'they', 'those', 'the same', 'what about',
+      'how about', 'and then', 'after that', 'next', 'also'
+    ];
+    
+    const queryLower = query.toLowerCase();
+    const hasIndicator = followUpIndicators.some(indicator => 
+      queryLower.includes(indicator)
+    );
+    
+    // Also check if query is very short (likely referencing previous context)
+    const isShort = query.split(' ').length <= 5;
+    
+    return hasIndicator || isShort;
   }
 }
 

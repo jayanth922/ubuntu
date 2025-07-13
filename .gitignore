@@ -49,3 +49,19 @@ env/
 *.swp
 *.swo
 .DS_Store
+
+# Test files and temporary documentation
+test_*.py
+*_test.py
+*_guide.md
+*integration*.md
+start_*.sh
+stop_*.sh
+
+# Logs
+*.log
+logs/
+
+# OS generated files
+Thumbs.db
+ehthumbs.db

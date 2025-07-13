@@ -1,76 +1,156 @@
+version: '3.8'
+
 services:
-  # Frontend services
+  # Frontend React application
   frontend:
-    build: ./frontend
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
     ports:
       - "3000:3000"
     environment:
       - REACT_APP_API_URL=http://localhost:8000
-    volumes:
-      - ./frontend:/app
-      - /app/node_modules
+      - NODE_ENV=production
     depends_on:
       - dialog_manager
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "http://localhost:3000"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
 
-  # Backend services
-  intent_service:
-    build: ./backend/intent_service
-    ports:
-      - "8001:8000"
-    volumes:
-      - ./backend/intent_service:/app
-    environment:
-      - LOG_LEVEL=INFO
-    depends_on:
-      - redis
-
+  # Dialog Manager - Node.js service
   dialog_manager:
-    build: ./backend/dialog_manager
+    build:
+      context: ./backend/dialog_manager
+      dockerfile: Dockerfile
     ports:
       - "8000:8000"
-    volumes:
-      - ./backend/dialog_manager:/app
-      - /app/node_modules
     environment:
-      - INTENT_SERVICE_URL=http://intent_service:8000
-      - RAG_SERVICE_URL=http://rag_service:8000
+      - PORT=8000
+      - INTENT_SERVICE_URL=http://intent_service:8001
+      - RAG_SERVICE_URL=http://rag_service:8002
       - REDIS_URL=redis://redis:6379
+      - NODE_ENV=production
+      - LOG_LEVEL=info
     depends_on:
       - intent_service
       - rag_service
       - redis
-
-  rag_service:
-    build: ./backend/rag_service
-    ports:
-      - "8002:8000"
     volumes:
-      - ./backend/rag_service:/app
-      - ./data:/data
-    environment:
-      - LOG_LEVEL=INFO
-    depends_on:
-      - redis
+      - dialog_manager_data:/app/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
 
-  # Infrastructure services
+  # Intent Classification Service - Python/FastAPI
+  intent_service:
+    build:
+      context: ./backend/intent_service
+      dockerfile: Dockerfile
+    ports:
+      - "8001:8001"
+    environment:
+      - PORT=8001
+      - MODEL_PATH=/app/models
+      - REDIS_URL=redis://redis:6379
+      - LOG_LEVEL=INFO
+      - MAX_WORKERS=2
+    volumes:
+      - intent_service_models:/app/models
+      - intent_service_data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8001/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 2G
+        reservations:
+          cpus: '0.5'
+          memory: 1G
+
+  # RAG Service - Python/FastAPI
+  rag_service:
+    build:
+      context: ./backend/rag_service
+      dockerfile: Dockerfile
+    ports:
+      - "8002:8002"
+    environment:
+      - PORT=8002
+      - DATA_RAW_DIR=/data/raw
+      - DATA_PROCESSED_DIR=/data/processed
+      - DATA_INDEX_DIR=/data/index
+      - REDIS_URL=redis://redis:6379
+      - SENTENCE_TRANSFORMER_DEVICE=cpu
+      - CHUNK_SIZE=512
+      - CHUNK_OVERLAP=128
+      - LOG_LEVEL=INFO
+      - MAX_WORKERS=2
+    volumes:
+      - rag_service_data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8002/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 6G
+        reservations:
+          cpus: '0.5'
+          memory: 3G
+
+  # Redis for session storage, caching, and messaging
   redis:
-    image: redis:7.0-alpine
+    image: redis:6.2-alpine
     ports:
       - "6379:6379"
     volumes:
       - redis_data:/data
-
-  postgres:
-    image: postgres:15-alpine
-    ports:
-      - "5432:5432"
-    environment:
-      - POSTGRES_USER=chatbot
-      - POSTGRES_PASSWORD=chatbot_pass
-      - POSTGRES_DB=chatbot_db
-    volumes:
-      - postgres_data:/var/lib/postgresql/data
+    command: redis-server --appendonly yes --maxmemory 512mb --maxmemory-policy allkeys-lru
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 1G
 
 volumes:
+  dialog_manager_data:
+    driver: local
+  intent_service_models:
+    driver: local
+  intent_service_data:
+    driver: local
+  rag_service_data:
+    driver: local
   redis_data:
-  postgres_data:
+    driver: local
+
+networks:
+  default:
+    name: ubuntu_chatbot_network
+    driver: bridge
